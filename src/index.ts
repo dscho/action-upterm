@@ -290,6 +290,10 @@ set-environment -g XDG_RUNTIME_DIR "${xdgRuntimeDir}"
 set-environment -g XDG_STATE_HOME "${xdgStateHome}"
 set-environment -g XDG_CONFIG_HOME "${xdgConfigHome}"
 
+# Allow UPTERM_ADMIN_SOCKET to be inherited from client environment
+# This enables 'upterm session current' to work without --admin-socket flag
+set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
+
 # Enable aggressive window resizing for better multi-client support
 setw -g aggressive-resize on
 `;
