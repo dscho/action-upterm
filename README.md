@@ -72,6 +72,27 @@ jobs:
         upterm-server: wss://YOUR_HEROKU_APP_URL
 ```
 
+## Pin a Specific Upterm Version
+
+By default, the action downloads the latest Upterm release directly from GitHub. To pin a specific release (for example, `v0.20.0`), provide the optional `upterm-version` input:
+
+```yaml
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v1
+      with:
+        upterm-version: v0.20.0
+```
+
+- Works on all platforms (Linux, macOS, and Windows).
+- On macOS, Upterm is installed from the GitHub release tarball (Homebrew is still used for installing `tmux` only).
+
 ## Shut Down the Server if No User Connects
 
 If no user connects, the server automatically shuts down after a specified time. This feature is handy for deploying `action-upterm` to provide a debug shell on job failure without unnecessarily prolonging pipeline operation.
