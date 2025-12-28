@@ -303,12 +303,12 @@ setw -g aggressive-resize on
   core.debug(`Created tmux config at ${tmuxConfPath}`);
 
   // Use -f to load our custom config for both outer and inner tmux sessions
-  // Use Windows-style path (C:/...) for tmux -f flag as it works in MSYS2
-  // For outer tmux, use shellEscape since it runs directly in bash
-  // For inner tmux (passed through upterm.exe), don't escape to avoid quoting issues
+  // For outer tmux: Use Windows path (C:/...) with quotes since it runs in bash
+  // For inner tmux: Use POSIX path (/c/...) without quotes since upterm.exe spawns it
   const tmuxConfPathShell = toShellPath(tmuxConfPath);
+  const tmuxConfPathPosix = toMsys2Path(tmuxConfPath);
   const tmuxConfFlagOuter = `-f ${shellEscape(tmuxConfPathShell)}`;
-  const tmuxConfFlagInner = `-f ${tmuxConfPathShell}`;
+  const tmuxConfFlagInner = `-f ${tmuxConfPathPosix}`;
 
   try {
     await execShellCommand(
