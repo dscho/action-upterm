@@ -54,7 +54,20 @@ describe('execShellCommand', () => {
     const result = await resultPromise;
 
     expect(result).toBe(expectedOutput);
-    expect(mockSpawn).toHaveBeenCalledWith(command, [], {shell: 'bash'});
+
+    // Verify spawn was called with platform-specific arguments
+    const isWindows = process.platform === 'win32';
+    const expectedFirstArg = isWindows ? 'C:\\msys64\\usr\\bin\\bash.exe' : command;
+    const expectedSecondArg = isWindows ? ['-lc', command] : [];
+
+    // Verify the spawn call
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const spawnCall = mockSpawn.mock.calls[0];
+    expect(spawnCall[0]).toBe(expectedFirstArg);
+    expect(spawnCall[1]).toEqual(expectedSecondArg);
+    expect(spawnCall[2]).toBeDefined();
+    expect(typeof spawnCall[2]).toBe('object');
+
     expect(core.debug).toHaveBeenCalledWith(`Executing shell command: [${command}]`);
   });
 

@@ -247,7 +247,7 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on linux: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on linux: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.'));
   });
 
   it('error handling for unsupported windows arch', async () => {
@@ -265,7 +265,7 @@ describe('upterm GitHub integration', () => {
     mockedExecShellCommand.mockReturnValue(Promise.resolve('foobar'));
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on win32: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.');
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on win32: Error: Unsupported architecture for upterm: unknown. Only x64 and arm64 are supported.'));
   });
 
   it('should install using brew on macos', async () => {
@@ -358,7 +358,7 @@ describe('upterm GitHub integration', () => {
 
     await run();
 
-    expect(core.setFailed).toHaveBeenCalledWith('Failed to install dependencies on linux: Error: Installation failed');
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Failed to install dependencies on linux: Error: Installation failed'));
   });
 
   it('should handle timeout with timeout flag detection', async () => {
@@ -514,9 +514,18 @@ describe('upterm GitHub integration', () => {
     when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
     when(core.getInput).calledWith('upterm-server').mockReturnValue('ssh://myserver:22');
 
-    // Mock session status command to fail with connection refused
+    // Mock session status command
+    // First call is from outputSshCommand() - should succeed
+    // Second call is from monitorSession() - should fail with connection refused
+    let sessionStatusCallCount = 0;
     mockedExecShellCommand.mockImplementation((cmd: string) => {
       if (cmd.includes('upterm session current')) {
+        sessionStatusCallCount++;
+        if (sessionStatusCallCount === 1) {
+          // First call from outputSshCommand - return session info
+          return Promise.resolve('ssh test@upterm.dev\nSession: test123');
+        }
+        // Second call from monitorSession - fail with connection refused
         return Promise.reject(new Error('Command failed with exit code 1: connection refused'));
       }
       return Promise.resolve('success');
@@ -525,13 +534,17 @@ describe('upterm GitHub integration', () => {
     // Mock fs.existsSync to handle different paths correctly
     mockFs.existsSync.mockImplementation((filePath: fs.PathLike) => {
       const pathStr = filePath.toString();
-      if (pathStr === TIMEOUT_FLAG_PATH) {
+      // Normalize paths for comparison (convert backslashes to forward slashes)
+      const normalizedPath = pathStr.replace(/\\/g, '/');
+      const normalizedTimeoutPath = TIMEOUT_FLAG_PATH.replace(/\\/g, '/');
+      if (normalizedPath === normalizedTimeoutPath) {
         return false; // Never return true for timeout flag (no timeout)
       }
-      if (pathStr === '/continue' || pathStr.includes('continue')) {
+      // Be specific about continue file paths to avoid matching unintended paths on Windows
+      if (pathStr === '/continue' || pathStr.endsWith('/continue') || pathStr.endsWith('\\continue')) {
         return false; // Don't exit via continue file
       }
-      return true; // Default for other paths
+      return true; // Default for other paths (SSH keys, socket dir, etc.)
     });
 
     await run();

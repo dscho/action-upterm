@@ -9,9 +9,9 @@ This GitHub Action enables direct interaction with the host system running your 
 
 ## Supported Operating Systems
 
-- **Linux**
-- **macOS**
-- **Windows**: Unsupported (actions will skip to avoid pipeline failures).
+- **Linux** - Fully supported
+- **macOS** - Fully supported
+- **Windows** - Supported (requires MSYS2, automatically installed on GitHub Actions Windows runners)
 
 ## Getting Started
 
@@ -116,3 +116,19 @@ After connecting via SSH:
 
 This will resize the console to the full width and height of the connected terminal.
 ([Learn more](https://unix.stackexchange.com/a/570015))
+
+### Windows Support
+
+Windows runners are fully supported through MSYS2 (pre-installed on GitHub Actions Windows runners). The action automatically:
+- Downloads the Windows build of upterm
+- Installs tmux via pacman (MSYS2 package manager)
+- Handles Windows/POSIX path format conversions internally
+
+**Continue file locations on Windows:**
+```bash
+# In the workflow workspace (recommended, no sudo/admin required)
+cd $GITHUB_WORKSPACE && touch continue
+
+# Or at the MSYS2 root (may require elevation)
+touch /c/msys64/continue
+```
