@@ -304,11 +304,15 @@ setw -g aggressive-resize on
 
   // Use -f to load our custom config for both outer and inner tmux sessions
   // Use Windows-style path (C:/...) for tmux -f flag as it works in MSYS2
-  const tmuxConfFlag = `-f ${shellEscape(toShellPath(tmuxConfPath))}`;
+  // For outer tmux, use shellEscape since it runs directly in bash
+  // For inner tmux (passed through upterm.exe), don't escape to avoid quoting issues
+  const tmuxConfPathShell = toShellPath(tmuxConfPath);
+  const tmuxConfFlagOuter = `-f ${shellEscape(tmuxConfPathShell)}`;
+  const tmuxConfFlagInner = `-f ${tmuxConfPathShell}`;
 
   try {
     await execShellCommand(
-      `tmux ${tmuxConfFlag} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlag} new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
+      `tmux ${tmuxConfFlagOuter} new -d -s upterm-wrapper -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} "upterm host --skip-host-key-check --accept --server ${shellEscape(uptermServer)} ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux ${tmuxConfFlagInner} new -s upterm -x ${TMUX_DIMENSIONS.width} -y ${TMUX_DIMENSIONS.height} 2>&1 | tee ${shellEscape(getUptermCommandLogPath())}" 2>${shellEscape(getTmuxErrorLogPath())}`
     );
     core.debug('Created new session successfully');
   } catch (error) {
