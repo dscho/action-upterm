@@ -4,9 +4,7 @@ import path from 'path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as tc from '@actions/tool-cache';
-import {execShellCommand} from './helpers';
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+import {execShellCommand, sleep} from './helpers';
 
 // Constants
 const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
@@ -209,11 +207,27 @@ function validateInputs(): void {
 
 export async function run() {
   try {
+    // Check if this is the POST action
+    if (core.getState('isPost') === 'true') {
+      await runPost();
+      return;
+    }
+
     validateInputs();
 
     await installDependencies();
     await setupSSH();
     await startUptermSession();
+
+    // Mark that the main action has run (for POST action detection)
+    core.saveState('isPost', 'true');
+
+    const detached = core.getInput('detached');
+    if (detached === 'true') {
+      await runDetachedMode();
+      return;
+    }
+
     await monitorSession();
   } catch (error: unknown) {
     if (error instanceof Error) {
@@ -668,4 +682,116 @@ function isTimeoutReached(): boolean {
 function logTimeoutMessage(): void {
   core.info('Upterm session timed out - no client connected within the specified wait-timeout-minutes');
   core.info('The session was automatically shut down to prevent unnecessary resource usage');
+}
+
+async function getSessionInfo(): Promise<{sshCommand: string} | null> {
+  const socketPath = findUptermSocket();
+  if (!socketPath) return null;
+
+  try {
+    const output = await execShellCommand(`upterm session current --admin-socket "${socketPath}"`);
+    const sshMatch = output.match(/ssh\s+(\S+@\S+)/i);
+    if (sshMatch) {
+      const sshCommand = `ssh ${sshMatch[1]}`;
+      return {sshCommand};
+    }
+  } catch (error) {
+    core.debug(`Failed to get session info: ${error}`);
+  }
+  return null;
+}
+
+async function runDetachedMode(): Promise<void> {
+  core.debug('Entering detached mode');
+
+  let sessionInfo = await getSessionInfo();
+  for (let i = 0; !sessionInfo && i < 12; i++) {
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
+    sessionInfo = await getSessionInfo();
+  }
+  if (!sessionInfo) {
+    throw new Error('Failed to get upterm session information');
+  }
+
+  const message = `::notice::SSH: ${sessionInfo.sshCommand}\n`;
+
+  // Set outputs for other workflow steps to use
+  core.setOutput('ssh-command', sessionInfo.sshCommand);
+
+  // Save state for the POST action
+  core.saveState('message', message);
+  core.saveState('socketPath', findUptermSocket() || '');
+
+  console.log(message);
+  core.info('Detached mode: workflow will continue while upterm session is active');
+}
+
+async function hasAnyoneConnectedYet(): Promise<boolean> {
+  try {
+    // Check if any client is attached to the upterm session by looking for tmux attach processes
+    const result = await execShellCommand("pgrep -f '^tmux attach ' 2>/dev/null || echo ''");
+    return result.trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
+async function runPost(): Promise<void> {
+  const message = core.getState('message');
+  const socketPath = core.getState('socketPath');
+
+  if (!message || !socketPath) {
+    // Not in detached mode or session wasn't started properly
+    return;
+  }
+
+  const shutdown = async () => {
+    core.error('Got signal');
+    try {
+      await execShellCommand('tmux kill-server 2>/dev/null || true');
+    } catch {
+      // Ignore errors during shutdown
+    }
+    process.exit(1);
+  };
+
+  // Support canceling the post-job Action
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  core.debug('Waiting for session to end');
+
+  let waitTimeoutSeconds = parseInt(core.getInput('wait-timeout-minutes') || '10', 10) * 60;
+  if (isNaN(waitTimeoutSeconds) || waitTimeoutSeconds <= 0) {
+    waitTimeoutSeconds = 10 * 60; // Default 10 minutes
+  }
+
+  let anyoneConnected = false;
+
+  for (let seconds = waitTimeoutSeconds; seconds > 0; ) {
+    const connected = await hasAnyoneConnectedYet();
+    if (connected) anyoneConnected = true;
+
+    console.log(`${anyoneConnected ? 'Waiting for session to end' : `Waiting for client to connect (at most ${seconds} more second(s))`}\n${message}`);
+
+    if (continueFileExists()) {
+      core.info("Exiting debugging session because '/continue' file was created");
+      break;
+    }
+
+    if (!uptermSocketExists()) {
+      core.info("Exiting debugging session: 'upterm' quit");
+      break;
+    }
+
+    await sleep(5000);
+    if (!anyoneConnected) seconds -= 5;
+  }
+
+  // Clean up
+  try {
+    await execShellCommand('tmux kill-server 2>/dev/null || true');
+  } catch {
+    // Ignore cleanup errors
+  }
 }
