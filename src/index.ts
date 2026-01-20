@@ -707,7 +707,11 @@ async function getSessionInfo(): Promise<{sshCommand: string} | null> {
 async function runDetachedMode(): Promise<void> {
   core.debug('Entering detached mode');
 
-  const sessionInfo = await getSessionInfo();
+  let sessionInfo = await getSessionInfo();
+  for (let i = 0; !sessionInfo && i < 12; i++) {
+    await sleep(SESSION_STATUS_POLL_INTERVAL);
+    sessionInfo = await getSessionInfo();
+  }
   if (!sessionInfo) {
     throw new Error('Failed to get upterm session information');
   }
