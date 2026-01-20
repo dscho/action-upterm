@@ -21,8 +21,6 @@ jobs:
       - run: yarn test
       - run: yarn lint
       - run: yarn build
-      - uses: owenthereal/action-upterm@main
-        if: matrix.os == 'ubuntu-latest'
 
   e2e:
     runs-on: ubuntu-latest
