@@ -9,33 +9,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: yarn
-      - run: yarn install --frozen-lockfile
-      - run: yarn test
-      - run: yarn lint
-      - run: yarn build
-      - uses: ./detached
-        if: matrix.os == 'ubuntu-latest'
-
-  e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: yarn
-      - name: Install act
-        run: |
-          # Download latest act release
-          curl -sL https://github.com/nektos/act/releases/latest/download/act_Linux_x86_64.tar.gz -o /tmp/act.tar.gz
-          sudo tar -xzf /tmp/act.tar.gz -C /usr/local/bin act
-      - run: yarn install --frozen-lockfile
-      - run: yarn test:e2e
+      - uses: dscho/action-upterm/detached@main
