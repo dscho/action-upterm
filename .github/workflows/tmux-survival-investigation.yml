@@ -1,0 +1,269 @@
+# Experiment: What kills tmux on Windows runners?
+#
+# Background: In a detached-mode run on windows-latest, the post action
+# found tmux already dead ("no server running on /tmp/tmux-197108/default")
+# and immediately exited.  We know the runner's end-of-job orphan sweep
+# kills everything, but that happens *after* the post action runs.
+# Something earlier reaped tmux.
+#
+# Hypotheses:
+#   H1  A sibling step's timeout-minutes kill cascades to tmux
+#   H2  Killing the Node.js action host process kills tmux (ancestor chain)
+#   H3  A step that exits non-zero triggers cleanup that catches tmux
+#   H4  Elapsed wall-clock time alone causes tmux/upterm to self-exit
+#
+# Design: one job per hypothesis, plus a baseline.  Each job:
+#   1. Installs upterm + tmux (same as the action does on Windows)
+#   2. Generates SSH keys and starts the same nested tmux/upterm topology
+#   3. Launches a WMI-spawned watchdog (escapes Job Object) that polls
+#      tmux/upterm PIDs every second and writes to a log file
+#   4. Applies the treatment (timeout, kill, failure, sleep)
+#   5. Collects all evidence in an always() step and uploads as artifact
+#
+# Predictions (falsifiable):
+#   baseline:      tmux alive at collector step
+#   timeout-kill:  if H1, tmux dies at the timeout instant
+#   node-kill:     if H2, tmux dies when we kill node
+#   failure-step:  if H3, tmux dies after the failing step
+#   long-elapsed:  if H4, tmux dies after ~10-15 min even with no treatment
+
+name: "Investigate: what kills tmux on Windows?"
+
+on:
+  push:
+    branches:
+      - tmux-survival-investigation
+
+env:
+  UPTERM_DATA: C:\Users\runneradmin\AppData\Local\Temp\upterm-data
+
+jobs:
+
+  # ── H0: Baseline ────────────────────────────────────────────────
+  baseline:
+    name: "H0 — baseline (no treatment)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps and start tmux/upterm session
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          source experiments/tmux-survival/setup.sh
+
+      - name: Start watchdog
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-watchdog.ps1
+
+      - name: Treatment — none (sleep 60s as control)
+        shell: pwsh
+        run: Start-Sleep 60
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-baseline
+          path: evidence/
+
+  # ── H1: Sibling step timeout ────────────────────────────────────
+  timeout-kill:
+    name: "H1 — sibling step timeout-minutes"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps and start tmux/upterm session
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          source experiments/tmux-survival/setup.sh
+
+      - name: Start watchdog
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-watchdog.ps1
+
+      - name: Treatment — step that times out after 1 min
+        timeout-minutes: 1
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          echo "This step will be killed by its timeout-minutes: 1"
+          sleep 3600
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-timeout-kill
+          path: evidence/
+
+  # ── H2: Node.js host process killed ─────────────────────────────
+  node-kill:
+    name: "H2 — kill the Node.js host process"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps and start tmux/upterm session
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          source experiments/tmux-survival/setup.sh
+
+      - name: Start watchdog, then terminate launcher bash
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-watchdog.ps1
+
+          # The setup.sh spawned a background `sleep 1800` to keep the
+          # process tree alive.  Terminate the bash that launched tmux
+          # (recorded in bash-pid.txt) to simulate action host death.
+          $bashPidFile = "$env:UPTERM_DATA\bash-pid.txt"
+          if (Test-Path $bashPidFile) {
+            # The bash PID is an MSYS2 PID; translate to Windows PID
+            $msysPid = (Get-Content $bashPidFile).Trim()
+            Write-Host "MSYS2 bash PID from file: $msysPid"
+            # Find bash.exe processes and try to match
+            $bashProcs = Get-CimInstance Win32_Process -Filter "Name='bash.exe'"
+            foreach ($bp in $bashProcs) {
+              Write-Host "  bash.exe WinPID=$($bp.ProcessId) PPID=$($bp.ParentProcessId) CMD=$($bp.CommandLine)"
+            }
+            # Since MSYS2 PIDs don't map directly, just terminate all
+            # bash.exe processes that look like our launcher (have -leo in cmdline)
+            $launcher = $bashProcs | Where-Object { $_.CommandLine -match 'setup\.sh' -or $_.CommandLine -match 'pipefail' }
+            if ($launcher) {
+              foreach ($lp in $launcher) {
+                Write-Host "Terminating launcher bash.exe WinPID=$($lp.ProcessId)"
+                Stop-Process -Id $lp.ProcessId -Force -ErrorAction SilentlyContinue
+              }
+            } else {
+              Write-Host "WARNING: Could not identify launcher bash.exe"
+            }
+          }
+          Write-Host "Waiting 10s for cascading effects..."
+          Start-Sleep 10
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-node-kill
+          path: evidence/
+
+  # ── H3: Step exits non-zero ─────────────────────────────────────
+  failure-step:
+    name: "H3 — sibling step exits non-zero"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps and start tmux/upterm session
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          source experiments/tmux-survival/setup.sh
+
+      - name: Start watchdog
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-watchdog.ps1
+
+      - name: Treatment — step that fails (exit 1)
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          echo "This step exits non-zero to test whether failure cleanup kills tmux"
+          exit 1
+
+      - name: Post-failure delay (let any cleanup propagate)
+        if: always()
+        shell: pwsh
+        run: Start-Sleep 15
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-failure-step
+          path: evidence/
+
+  # ── H4: Elapsed wall-clock time ─────────────────────────────────
+  long-elapsed:
+    name: "H4 — 15 min elapsed, no other treatment"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps and start tmux/upterm session
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: |
+          source experiments/tmux-survival/setup.sh
+
+      - name: Start watchdog
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-watchdog.ps1
+
+      - name: Treatment — sleep 15 minutes
+        shell: pwsh
+        run: |
+          Write-Host "Sleeping 15 minutes to test whether tmux self-exits"
+          Start-Sleep 900
+
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-long-elapsed
+          path: evidence/
