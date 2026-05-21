@@ -1,31 +1,11 @@
-# Experiment: What kills tmux on Windows runners?
+# Experiment phase 2: Can tmux escape the Job Object?
 #
-# Background: In a detached-mode run on windows-latest, the post action
-# found tmux already dead ("no server running on /tmp/tmux-197108/default")
-# and immediately exited.  We know the runner's end-of-job orphan sweep
-# kills everything, but that happens *after* the post action runs.
-# Something earlier reaped tmux.
+# Phase 1 confirmed: step timeout-minutes terminates tmux because it
+# stays in the runner's Job Object.  Phase 2 tests escape mechanisms.
 #
-# Hypotheses:
-#   H1  A sibling step's timeout-minutes kill cascades to tmux
-#   H2  Killing the Node.js action host process kills tmux (ancestor chain)
-#   H3  A step that exits non-zero triggers cleanup that catches tmux
-#   H4  Elapsed wall-clock time alone causes tmux/upterm to self-exit
-#
-# Design: one job per hypothesis, plus a baseline.  Each job:
-#   1. Installs upterm + tmux (same as the action does on Windows)
-#   2. Generates SSH keys and starts the same nested tmux/upterm topology
-#   3. Launches a WMI-spawned watchdog (escapes Job Object) that polls
-#      tmux/upterm PIDs every second and writes to a log file
-#   4. Applies the treatment (timeout, kill, failure, sleep)
-#   5. Collects all evidence in an always() step and uploads as artifact
-#
-# Predictions (falsifiable):
-#   baseline:      tmux alive at collector step
-#   timeout-kill:  if H1, tmux dies at the timeout instant
-#   node-kill:     if H2, tmux dies when we kill node
-#   failure-step:  if H3, tmux dies after the failing step
-#   long-elapsed:  if H4, tmux dies after ~10-15 min even with no treatment
+# Each job starts tmux/upterm via a different launch method, then
+# subjects it to a 1-minute timeout.  The WMI watchdog (proven to
+# survive timeouts) records whether tmux survived.
 
 name: "Investigate: what kills tmux on Windows?"
 
@@ -39,231 +19,273 @@ env:
 
 jobs:
 
-  # ── H0: Baseline ────────────────────────────────────────────────
-  baseline:
-    name: "H0 — baseline (no treatment)"
+  # ── Diagnostic: Query Job Object flags ──────────────────────────
+  job-object-flags:
+    name: "Diag: Job Object flags"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install deps and start tmux/upterm session
-        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
-        env:
-          MSYS2_PATH_TYPE: inherit
-          CHERE_INVOKING: 1
-          MSYSTEM: MINGW64
-        run: |
-          source experiments/tmux-survival/setup.sh
-
-      - name: Start watchdog
+      - name: Query Job Object flags
         shell: pwsh
         run: |
-          . experiments/tmux-survival/start-watchdog.ps1
+          $evidence = Join-Path $PWD 'evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
 
-      - name: Treatment — none (sleep 60s as control)
-        shell: pwsh
-        run: Start-Sleep 60
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
 
-      - name: Collect evidence
-        if: always()
-        shell: pwsh
-        run: . experiments/tmux-survival/collect.ps1
+          public class JobObjectInfo {
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern bool IsProcessInJob(IntPtr hProcess, IntPtr hJob, out bool result);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern bool QueryInformationJobObject(
+                  IntPtr hJob, int infoClass, ref JOBOBJECT_BASIC_LIMIT_INFORMATION info,
+                  int cbSize, IntPtr lpReturnLength);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern bool QueryInformationJobObject(
+                  IntPtr hJob, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info,
+                  int cbSize, IntPtr lpReturnLength);
+
+              [StructLayout(LayoutKind.Sequential)]
+              public struct IO_COUNTERS {
+                  public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+                  public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+              }
+
+              [StructLayout(LayoutKind.Sequential)]
+              public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                  public long PerProcessUserTimeLimit;
+                  public long PerJobUserTimeLimit;
+                  public uint LimitFlags;
+                  public UIntPtr MinimumWorkingSetSize;
+                  public UIntPtr MaximumWorkingSetSize;
+                  public uint ActiveProcessLimit;
+                  public UIntPtr Affinity;
+                  public uint PriorityClass;
+                  public uint SchedulingClass;
+              }
+
+              [StructLayout(LayoutKind.Sequential)]
+              public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                  public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+                  public IO_COUNTERS IoInfo;
+                  public UIntPtr ProcessMemoryLimit;
+                  public UIntPtr JobMemoryLimit;
+                  public UIntPtr PeakProcessMemoryUsed;
+                  public UIntPtr PeakJobMemoryUsed;
+              }
+
+              public static string GetFlags() {
+                  bool isInJob;
+                  IsProcessInJob(System.Diagnostics.Process.GetCurrentProcess().Handle, IntPtr.Zero, out isInJob);
+                  if (!isInJob) return "NOT in a Job Object";
+
+                  var info = new JOBOBJECT_BASIC_LIMIT_INFORMATION();
+                  bool ok = QueryInformationJobObject(IntPtr.Zero, 2, ref info,
+                      Marshal.SizeOf(info), IntPtr.Zero);
+                  if (!ok) return "In Job Object but QueryInformationJobObject failed: " +
+                      Marshal.GetLastWin32Error();
+
+                  uint flags = info.LimitFlags;
+                  string result = "LimitFlags = 0x" + flags.ToString("X8") + "\n";
+                  // Key flags
+                  if ((flags & 0x00000800) != 0) result += "  JOB_OBJECT_LIMIT_BREAKAWAY_OK\n";
+                  if ((flags & 0x00001000) != 0) result += "  JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK\n";
+                  if ((flags & 0x00002000) != 0) result += "  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE\n";
+                  if ((flags & 0x00000001) != 0) result += "  JOB_OBJECT_LIMIT_WORKINGSET\n";
+                  if ((flags & 0x00000002) != 0) result += "  JOB_OBJECT_LIMIT_PROCESS_TIME\n";
+                  if ((flags & 0x00000004) != 0) result += "  JOB_OBJECT_LIMIT_JOB_TIME\n";
+                  if ((flags & 0x00000008) != 0) result += "  JOB_OBJECT_LIMIT_ACTIVE_PROCESS\n";
+                  if ((flags & 0x00000010) != 0) result += "  JOB_OBJECT_LIMIT_AFFINITY\n";
+                  if ((flags & 0x00000020) != 0) result += "  JOB_OBJECT_LIMIT_PRIORITY_CLASS\n";
+                  if ((flags & 0x00000040) != 0) result += "  JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME\n";
+                  if ((flags & 0x00000080) != 0) result += "  JOB_OBJECT_LIMIT_SCHEDULING_CLASS\n";
+                  if ((flags & 0x00000100) != 0) result += "  JOB_OBJECT_LIMIT_PROCESS_MEMORY\n";
+                  if ((flags & 0x00000200) != 0) result += "  JOB_OBJECT_LIMIT_JOB_MEMORY\n";
+                  if ((flags & 0x00000400) != 0) result += "  JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION\n";
+                  return result;
+              }
+          }
+          "@
+
+          $result = [JobObjectInfo]::GetFlags()
+          Write-Host $result
+          $result | Out-File "$evidence/job-object-flags.txt"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-baseline
+          name: evidence-job-object-flags
           path: evidence/
 
-  # ── H1: Sibling step timeout ────────────────────────────────────
-  timeout-kill:
-    name: "H1 — sibling step timeout-minutes"
+  # ── E1: Baseline (direct tmux, timeout) ────────────────────────
+  direct-tmux:
+    name: "E1: direct tmux (control, expect FAIL)"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install deps and start tmux/upterm session
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
         env:
           MSYS2_PATH_TYPE: inherit
           CHERE_INVOKING: 1
           MSYSTEM: MINGW64
-        run: |
-          source experiments/tmux-survival/setup.sh
-
+        run: source experiments/tmux-survival/setup.sh
       - name: Start watchdog
         shell: pwsh
-        run: |
-          . experiments/tmux-survival/start-watchdog.ps1
-
-      - name: Treatment — step that times out after 1 min
+        run: . experiments/tmux-survival/start-watchdog.ps1
+      - name: Timeout treatment (1 min)
         timeout-minutes: 1
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
-        env:
-          MSYS2_PATH_TYPE: inherit
-          CHERE_INVOKING: 1
-          MSYSTEM: MINGW64
-        run: |
-          echo "This step will be killed by its timeout-minutes: 1"
-          sleep 3600
-
+        env: { MSYS2_PATH_TYPE: inherit, CHERE_INVOKING: 1, MSYSTEM: MINGW64 }
+        run: sleep 3600
       - name: Collect evidence
         if: always()
         shell: pwsh
         run: . experiments/tmux-survival/collect.ps1
-
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-timeout-kill
+          name: evidence-direct-tmux
           path: evidence/
 
-  # ── H2: Node.js host process killed ─────────────────────────────
-  node-kill:
-    name: "H2 — kill the Node.js host process"
+  # ── E2: WMI-spawned tmux ────────────────────────────────────────
+  wmi-spawn:
+    name: "E2: WMI-spawned tmux"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install deps and start tmux/upterm session
+      - name: Install deps (no session start)
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
         env:
           MSYS2_PATH_TYPE: inherit
           CHERE_INVOKING: 1
           MSYSTEM: MINGW64
-        run: |
-          source experiments/tmux-survival/setup.sh
-
-      - name: Start watchdog, then terminate launcher bash
+        run: source experiments/tmux-survival/setup-deps-only.sh
+      - name: Start tmux via WMI and start watchdog
         shell: pwsh
         run: |
+          . experiments/tmux-survival/start-via-wmi.ps1
           . experiments/tmux-survival/start-watchdog.ps1
-
-          # The setup.sh spawned a background `sleep 1800` to keep the
-          # process tree alive.  Terminate the bash that launched tmux
-          # (recorded in bash-pid.txt) to simulate action host death.
-          $bashPidFile = "$env:UPTERM_DATA\bash-pid.txt"
-          if (Test-Path $bashPidFile) {
-            # The bash PID is an MSYS2 PID; translate to Windows PID
-            $msysPid = (Get-Content $bashPidFile).Trim()
-            Write-Host "MSYS2 bash PID from file: $msysPid"
-            # Find bash.exe processes and try to match
-            $bashProcs = Get-CimInstance Win32_Process -Filter "Name='bash.exe'"
-            foreach ($bp in $bashProcs) {
-              Write-Host "  bash.exe WinPID=$($bp.ProcessId) PPID=$($bp.ParentProcessId) CMD=$($bp.CommandLine)"
-            }
-            # Since MSYS2 PIDs don't map directly, just terminate all
-            # bash.exe processes that look like our launcher (have -leo in cmdline)
-            $launcher = $bashProcs | Where-Object { $_.CommandLine -match 'setup\.sh' -or $_.CommandLine -match 'pipefail' }
-            if ($launcher) {
-              foreach ($lp in $launcher) {
-                Write-Host "Terminating launcher bash.exe WinPID=$($lp.ProcessId)"
-                Stop-Process -Id $lp.ProcessId -Force -ErrorAction SilentlyContinue
-              }
-            } else {
-              Write-Host "WARNING: Could not identify launcher bash.exe"
-            }
-          }
-          Write-Host "Waiting 10s for cascading effects..."
-          Start-Sleep 10
-
+      - name: Timeout treatment (1 min)
+        timeout-minutes: 1
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env: { MSYS2_PATH_TYPE: inherit, CHERE_INVOKING: 1, MSYSTEM: MINGW64 }
+        run: sleep 3600
       - name: Collect evidence
         if: always()
         shell: pwsh
         run: . experiments/tmux-survival/collect.ps1
-
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-node-kill
+          name: evidence-wmi-spawn
           path: evidence/
 
-  # ── H3: Step exits non-zero ─────────────────────────────────────
-  failure-step:
-    name: "H3 — sibling step exits non-zero"
+  # ── E3: Scheduled task ──────────────────────────────────────────
+  schtasks-spawn:
+    name: "E3: schtasks-spawned tmux"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install deps and start tmux/upterm session
+      - name: Install deps (no session start)
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
         env:
           MSYS2_PATH_TYPE: inherit
           CHERE_INVOKING: 1
           MSYSTEM: MINGW64
-        run: |
-          source experiments/tmux-survival/setup.sh
-
-      - name: Start watchdog
+        run: source experiments/tmux-survival/setup-deps-only.sh
+      - name: Start tmux via schtasks and start watchdog
         shell: pwsh
         run: |
+          . experiments/tmux-survival/start-via-schtasks.ps1
           . experiments/tmux-survival/start-watchdog.ps1
-
-      - name: Treatment — step that fails (exit 1)
+      - name: Timeout treatment (1 min)
+        timeout-minutes: 1
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
-        env:
-          MSYS2_PATH_TYPE: inherit
-          CHERE_INVOKING: 1
-          MSYSTEM: MINGW64
-        run: |
-          echo "This step exits non-zero to test whether failure cleanup kills tmux"
-          exit 1
-
-      - name: Post-failure delay (let any cleanup propagate)
-        if: always()
-        shell: pwsh
-        run: Start-Sleep 15
-
+        env: { MSYS2_PATH_TYPE: inherit, CHERE_INVOKING: 1, MSYSTEM: MINGW64 }
+        run: sleep 3600
       - name: Collect evidence
         if: always()
         shell: pwsh
         run: . experiments/tmux-survival/collect.ps1
-
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-failure-step
+          name: evidence-schtasks-spawn
           path: evidence/
 
-  # ── H4: Elapsed wall-clock time ─────────────────────────────────
-  long-elapsed:
-    name: "H4 — 15 min elapsed, no other treatment"
+  # ── E4: CREATE_BREAKAWAY_FROM_JOB forced ────────────────────────
+  breakaway-flag:
+    name: "E4: forced CREATE_BREAKAWAY_FROM_JOB"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install deps and start tmux/upterm session
+      - name: Install deps (no session start)
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
         env:
           MSYS2_PATH_TYPE: inherit
           CHERE_INVOKING: 1
           MSYSTEM: MINGW64
-        run: |
-          source experiments/tmux-survival/setup.sh
-
-      - name: Start watchdog
+        run: source experiments/tmux-survival/setup-deps-only.sh
+      - name: Start tmux with breakaway flag and start watchdog
         shell: pwsh
         run: |
+          . experiments/tmux-survival/start-via-breakaway.ps1
           . experiments/tmux-survival/start-watchdog.ps1
-
-      - name: Treatment — sleep 15 minutes
-        shell: pwsh
-        run: |
-          Write-Host "Sleeping 15 minutes to test whether tmux self-exits"
-          Start-Sleep 900
-
+      - name: Timeout treatment (1 min)
+        timeout-minutes: 1
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env: { MSYS2_PATH_TYPE: inherit, CHERE_INVOKING: 1, MSYSTEM: MINGW64 }
+        run: sleep 3600
       - name: Collect evidence
         if: always()
         shell: pwsh
         run: . experiments/tmux-survival/collect.ps1
-
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-long-elapsed
+          name: evidence-breakaway-flag
+          path: evidence/
+
+  # ── E5: Windows Service wrapper ─────────────────────────────────
+  nssm-service:
+    name: "E5: NSSM service wrapper"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps (no session start)
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          CHERE_INVOKING: 1
+          MSYSTEM: MINGW64
+        run: source experiments/tmux-survival/setup-deps-only.sh
+      - name: Start tmux via NSSM service and start watchdog
+        shell: pwsh
+        run: |
+          . experiments/tmux-survival/start-via-nssm.ps1
+          . experiments/tmux-survival/start-watchdog.ps1
+      - name: Timeout treatment (1 min)
+        timeout-minutes: 1
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        env: { MSYS2_PATH_TYPE: inherit, CHERE_INVOKING: 1, MSYSTEM: MINGW64 }
+        run: sleep 3600
+      - name: Collect evidence
+        if: always()
+        shell: pwsh
+        run: . experiments/tmux-survival/collect.ps1
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-nssm-service
           path: evidence/
